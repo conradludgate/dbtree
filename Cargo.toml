@@ -1,0 +1,11 @@
+[package]
+name = "dbtree"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+zerocopy = { version = "0.8.11", features = ["derive", "std"] }
+crc32fast = "1.4.2"
+
+[dev-dependencies]
+rand = "0.8"
