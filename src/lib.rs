@@ -43,7 +43,7 @@ pub trait Factor {
     type Branch<T: IntoBytes + FromBytes + KnownLayout + Unaligned + Immutable>: Array<T>;
 }
 
-struct DefaultTreeFactors;
+pub struct DefaultTreeFactors;
 
 impl Factor for DefaultTreeFactors {
     type Page = [u8; 4096];
@@ -101,7 +101,7 @@ impl fmt::Debug for KeyRef<'_> {
     }
 }
 
-impl<S: PageSource> fmt::Debug for TreeFmt<'_, S> {
+impl<S: PageSource<<DefaultTreeFactors as Factor>::Page>> fmt::Debug for TreeFmt<'_, S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.node == NODE_SENTINAL {
             return f.debug_map().finish();
@@ -137,7 +137,7 @@ impl<S: PageSource> fmt::Debug for TreeFmt<'_, S> {
     }
 }
 
-pub trait PageSource {
+pub trait PageSource<Page> {
     fn read(&self, page_ref: NodeRef) -> io::Result<Option<Page>>;
 
     fn must_read(&self, page_ref: NodeRef) -> io::Result<Page> {
@@ -150,7 +150,7 @@ pub trait PageSource {
     }
 }
 
-pub trait PageSink: PageSource {
+pub trait PageSink<Page: IntoBytes + FromBytes>: PageSource<Page> {
     fn write(&mut self, page_ref: NodeRef, page: &Page) -> io::Result<()>;
 
     fn write_page(&mut self, page_ref: NodeRef, page: &mut Page) -> io::Result<()> {
@@ -159,7 +159,7 @@ pub trait PageSink: PageSource {
     }
 }
 
-impl PageSource for Vec<Page> {
+impl<Page: Copy> PageSource<Page> for Vec<Page> {
     fn read(&self, page_ref: NodeRef) -> io::Result<Option<Page>> {
         Ok(usize::try_from(page_ref.offset.get())
             .ok()
@@ -168,7 +168,7 @@ impl PageSource for Vec<Page> {
     }
 }
 
-impl PageSink for Vec<Page> {
+impl<Page: IntoBytes + FromBytes + Copy> PageSink<Page> for Vec<Page> {
     fn write(&mut self, page_ref: NodeRef, page: &Page) -> io::Result<()> {
         // println!("write: {page_ref:?}");
 
@@ -180,7 +180,7 @@ impl PageSink for Vec<Page> {
         };
 
         if i > self.len() {
-            self.resize_with(i, || [0; 4096]);
+            self.resize_with(i, Page::new_zeroed);
         }
         if let Some(p) = self.get_mut(i) {
             *p = *page;
@@ -225,8 +225,8 @@ fn validate_page_mut<T: FromBytes + IntoBytes + KnownLayout>(
 }
 
 // checksum is always at the end of the page.
-pub fn update_checksum(page: &mut Page) {
-    let (rest, checksum) = Checksum::mut_from_suffix(page)
+pub fn update_checksum<Page: IntoBytes + FromBytes>(page: &mut Page) {
+    let (rest, checksum) = Checksum::mut_from_suffix(page.as_mut_bytes())
         .expect("should always be able to read a checksum from a page");
     checksum.set(crc32fast::hash(rest));
 }
@@ -235,7 +235,7 @@ type Checksum = little_endian::U32;
 
 pub type Page = [u8; 4096];
 
-impl<S: PageSource> BTree<S> {
+impl<S: PageSource<<DefaultTreeFactors as Factor>::Page>> BTree<S> {
     pub fn new(s: S) -> io::Result<Self> {
         let metadata;
         if let Some(page) = s.read(NODE_SENTINAL)? {
@@ -401,7 +401,10 @@ enum InsertInternalState {
     Split(Key, NodeRef),
 }
 
-impl<S: PageSink> BTree<S> {
+impl<S> BTree<S>
+where
+    S: PageSink<<DefaultTreeFactors as Factor>::Page>,
+{
     fn allocate(&mut self) -> io::Result<NodeRef> {
         // todo: use freelist
 
