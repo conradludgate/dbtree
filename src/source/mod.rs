@@ -3,6 +3,7 @@ use std::io;
 use crate::{array::Array, checksum::update_checksum, NodeRef};
 
 mod memory;
+mod file;
 
 pub trait PageSource<Page: Array<u8>> {
     fn read(&self, page_ref: NodeRef) -> io::Result<Option<Page>>;
