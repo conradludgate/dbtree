@@ -23,7 +23,7 @@ struct TreeFmt<'a, S> {
 mod array {
     use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
-    pub trait Array<T: IntoBytes + FromBytes + KnownLayout + Unaligned + Immutable>:
+    pub trait Array<T>:
         IntoBytes + FromBytes + KnownLayout + Unaligned + Immutable + AsRef<[T]> + AsMut<[T]>
     {
         const SIZE: usize;
@@ -69,7 +69,7 @@ impl Factor for DefaultTreeFactors {
 //     }
 // }
 
-struct KeyRef<'a>(&'a Key);
+struct KeyRef<'a>(&'a <DefaultTreeFactors as Factor>::Key);
 
 impl fmt::Debug for KeyRef<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -110,19 +110,22 @@ impl<S: PageSource<<DefaultTreeFactors as Factor>::Page>> fmt::Debug for TreeFmt
         let page = self.page_store.must_read(self.node).unwrap();
 
         if self.depth > 0 {
-            let node = InternalNode::ref_from_bytes(&page)
+            let node = InternalNode::<DefaultTreeFactors>::ref_from_bytes(&page)
                 .expect("all 4k pages should cast exactly to an InternalNode");
 
             let mut f = f.debug_list();
-            for i in 0..node.len as usize + 1 {
+            f.entry(&TreeFmt {
+                page_store: self.page_store,
+                node: node.min,
+                depth: self.depth - 1,
+            });
+            for i in 0..node.len as usize {
+                f.entry(&KeyRef(&node.keys[i]));
                 f.entry(&TreeFmt {
                     page_store: self.page_store,
                     node: node.values[i],
                     depth: self.depth - 1,
                 });
-                if i < node.len as usize {
-                    f.entry(&KeyRef(&node.keys[i]));
-                }
             }
             f.finish()
         } else {
@@ -137,7 +140,7 @@ impl<S: PageSource<<DefaultTreeFactors as Factor>::Page>> fmt::Debug for TreeFmt
     }
 }
 
-pub trait PageSource<Page> {
+pub trait PageSource<Page: Array<u8>> {
     fn read(&self, page_ref: NodeRef) -> io::Result<Option<Page>>;
 
     fn must_read(&self, page_ref: NodeRef) -> io::Result<Page> {
@@ -150,7 +153,7 @@ pub trait PageSource<Page> {
     }
 }
 
-pub trait PageSink<Page: IntoBytes + FromBytes>: PageSource<Page> {
+pub trait PageSink<Page: Array<u8>>: PageSource<Page> {
     fn write(&mut self, page_ref: NodeRef, page: &Page) -> io::Result<()>;
 
     fn write_page(&mut self, page_ref: NodeRef, page: &mut Page) -> io::Result<()> {
@@ -159,16 +162,20 @@ pub trait PageSink<Page: IntoBytes + FromBytes>: PageSource<Page> {
     }
 }
 
-impl<Page: Copy> PageSource<Page> for Vec<Page> {
+impl<Page: Array<u8>> PageSource<Page> for Vec<Page> {
     fn read(&self, page_ref: NodeRef) -> io::Result<Option<Page>> {
         Ok(usize::try_from(page_ref.offset.get())
             .ok()
             .and_then(|page| self.get(page))
-            .copied())
+            .map(onecopy))
     }
 }
 
-impl<Page: IntoBytes + FromBytes + Copy> PageSink<Page> for Vec<Page> {
+fn onecopy<T: IntoBytes + FromBytes + Immutable>(t: &T) -> T {
+    T::read_from_bytes(t.as_bytes()).unwrap()
+}
+
+impl<Page: Array<u8>> PageSink<Page> for Vec<Page> {
     fn write(&mut self, page_ref: NodeRef, page: &Page) -> io::Result<()> {
         // println!("write: {page_ref:?}");
 
@@ -183,9 +190,9 @@ impl<Page: IntoBytes + FromBytes + Copy> PageSink<Page> for Vec<Page> {
             self.resize_with(i, Page::new_zeroed);
         }
         if let Some(p) = self.get_mut(i) {
-            *p = *page;
+            *p = onecopy(page);
         } else {
-            self.push(*page);
+            self.push(onecopy(page));
         }
 
         Ok(())
@@ -267,16 +274,18 @@ impl<S: PageSource<<DefaultTreeFactors as Factor>::Page>> BTree<S> {
         &self,
         node_ref: NodeRef,
         depth: u64,
-        bounds: (Bound<&Key>, Bound<&Key>),
+        bounds: (
+            Bound<&<DefaultTreeFactors as Factor>::Key>,
+            Bound<&<DefaultTreeFactors as Factor>::Key>,
+        ),
     ) -> io::Result<()> {
         let page = self.page_store.must_read(node_ref)?;
 
         if depth > 0 {
-            let node = validate_page::<InternalNode>(&page)?;
+            let node = validate_page::<InternalNode<DefaultTreeFactors>>(&page)?;
 
             let len = node.len as usize;
             let keys = &node.keys[..len];
-            let values = &node.values[..len + 1];
 
             if !keys.is_sorted() {
                 return Err(io::Error::new(
@@ -303,13 +312,14 @@ impl<S: PageSource<<DefaultTreeFactors as Factor>::Page>> BTree<S> {
                 }
             }
 
-            self.validate_tree_bounds(values[0], depth - 1, (bounds.0, Bound::Excluded(&keys[0])))?;
-            for i in 1..=len {
+            let values = &node.values[..len];
+            self.validate_tree_bounds(node.min, depth - 1, (bounds.0, Bound::Excluded(&keys[0])))?;
+            for i in 0..len {
                 self.validate_tree_bounds(
                     values[i],
                     depth - 1,
                     (
-                        Bound::Included(&keys[i - 1]),
+                        Bound::Included(&keys[i]),
                         keys.get(i).map_or(bounds.1, Bound::Excluded),
                     ),
                 )?;
@@ -340,19 +350,28 @@ impl<S: PageSource<<DefaultTreeFactors as Factor>::Page>> BTree<S> {
         Ok(())
     }
 
-    fn search_internal_node(&self, node_ref: NodeRef, key: &Key) -> io::Result<NodeRef> {
+    fn search_internal_node(
+        &self,
+        node_ref: NodeRef,
+        key: &<DefaultTreeFactors as Factor>::Key,
+    ) -> io::Result<NodeRef> {
         let page = self.page_store.must_read(node_ref)?;
-        let node = validate_page::<InternalNode>(&page)?;
+        let node = validate_page::<InternalNode<DefaultTreeFactors>>(&page)?;
 
         let len = node.len as usize;
         let keys = &node.keys[..len];
         match keys.binary_search(key) {
-            Ok(i) => Ok(node.values[i + 1]),
-            Err(i) => Ok(node.values[i]),
+            Err(0) => Ok(node.min),
+            Ok(i) => Ok(node.values[i]),
+            Err(i) => Ok(node.values[i - 1]),
         }
     }
 
-    fn search_leaf_node(&self, node: NodeRef, key: &Key) -> io::Result<SearchEntry> {
+    fn search_leaf_node(
+        &self,
+        node: NodeRef,
+        key: &<DefaultTreeFactors as Factor>::Key,
+    ) -> io::Result<SearchEntry> {
         let page = self.page_store.must_read(node)?;
         let node = validate_page::<LeafNode<DefaultTreeFactors>>(&page)?;
 
@@ -364,7 +383,7 @@ impl<S: PageSource<<DefaultTreeFactors as Factor>::Page>> BTree<S> {
         }
     }
 
-    pub fn search(&self, key: &Key) -> io::Result<Option<NodeRef>> {
+    pub fn search(&self, key: &<DefaultTreeFactors as Factor>::Key) -> io::Result<Option<NodeRef>> {
         let mut depth = self.metadata.depth.get();
         let mut current = self.metadata.root;
 
@@ -388,7 +407,7 @@ impl<S: PageSource<<DefaultTreeFactors as Factor>::Page>> BTree<S> {
 enum InsertState {
     Inserted,
     Replaced(NodeRef),
-    Split(Key, NodeRef),
+    Split(<DefaultTreeFactors as Factor>::Key, NodeRef),
 }
 
 enum MustInsertState {
@@ -398,7 +417,7 @@ enum MustInsertState {
 
 enum InsertInternalState {
     Inserted,
-    Split(Key, NodeRef),
+    Split(<DefaultTreeFactors as Factor>::Key, NodeRef),
 }
 
 impl<S> BTree<S>
@@ -431,7 +450,7 @@ where
     fn insert_leaf_node(
         &mut self,
         page_ref: NodeRef,
-        key: &Key,
+        key: &<DefaultTreeFactors as Factor>::Key,
         value: NodeRef,
     ) -> io::Result<InsertState> {
         let mut page = self.page_store.must_read(page_ref)?;
@@ -449,7 +468,7 @@ where
 
                 Ok(InsertState::Replaced(old_value))
             }
-            Err(i) if len < BRANCH_FACTOR => {
+            Err(i) if len < <DefaultTreeFactors as Factor>::Branch::<u8>::SIZE => {
                 node.keys[i..].rotate_right(1);
                 node.values[i..].rotate_right(1);
 
@@ -464,7 +483,10 @@ where
             }
             // overflow
             Err(_) => {
-                debug_assert_eq!(node.len, BRANCH_FACTOR as u8);
+                debug_assert_eq!(
+                    node.len,
+                    <DefaultTreeFactors as Factor>::Branch::<u8>::SIZE as u8
+                );
 
                 let new_page_ref = self.allocate()?;
 
@@ -492,7 +514,7 @@ where
     fn must_insert_leaf_node(
         &mut self,
         page_ref: NodeRef,
-        key: &Key,
+        key: &<DefaultTreeFactors as Factor>::Key,
         value: NodeRef,
     ) -> io::Result<MustInsertState> {
         let mut page = self.page_store.must_read(page_ref)?;
@@ -510,7 +532,7 @@ where
 
                 Ok(MustInsertState::Replaced(old_value))
             }
-            Err(i) if len < BRANCH_FACTOR => {
+            Err(i) if len < <DefaultTreeFactors as Factor>::Branch::<u8>::SIZE => {
                 node.keys[i..].rotate_right(1);
                 node.values[i..].rotate_right(1);
 
@@ -530,28 +552,28 @@ where
     fn insert_internal_node(
         &mut self,
         page_ref: NodeRef,
-        key: &Key,
+        key: &<DefaultTreeFactors as Factor>::Key,
         value: NodeRef,
     ) -> io::Result<InsertInternalState> {
         let mut page = self.page_store.must_read(page_ref)?;
-        let node = validate_page_mut::<InternalNode>(&mut page)?;
+        let node = validate_page_mut::<InternalNode<DefaultTreeFactors>>(&mut page)?;
 
         let len = node.len as usize;
         let keys = &node.keys[..len];
-        let values = &node.values[..len + 1];
+        let values = &node.values[..len];
 
         dbg!((keys.iter().map(KeyRef).collect::<Vec<_>>(), values));
 
         match keys.binary_search(key) {
             Ok(_) => unreachable!("key should not already be here"),
             Err(0) => unreachable!("when inserting, we always split off the rhs, so this should never arrive on the left"),
-            Err(i) if len < BRANCH_FACTOR => {
+            Err(i) if len < <DefaultTreeFactors as Factor>::Branch::<u8>::SIZE => {
                 dbg!((KeyRef(key), i));
                 node.keys[i..].rotate_right(1);
-                node.values[i + 1..].rotate_right(1);
+                node.values[i..].rotate_right(1);
 
                 node.keys[i] = *key;
-                node.values[i + 1] = value;
+                node.values[i] = value;
                 node.len += 1;
 
                 update_checksum(&mut page);
@@ -562,7 +584,7 @@ where
             // overflow
             Err(_) => {
                 dbg!("split internal");
-                debug_assert_eq!(node.len, BRANCH_FACTOR as u8);
+                debug_assert_eq!(node.len as usize, <DefaultTreeFactors as Factor>::Branch::<u8>::SIZE);
 
                 let new_page_ref = self.allocate()?;
 
@@ -588,7 +610,11 @@ where
     }
 
     // returns the old NodeRef if there was one.
-    pub fn insert(&mut self, key: &Key, value: NodeRef) -> io::Result<Option<NodeRef>> {
+    pub fn insert(
+        &mut self,
+        key: &<DefaultTreeFactors as Factor>::Key,
+        value: NodeRef,
+    ) -> io::Result<Option<NodeRef>> {
         let mut depth = self.metadata.depth.get();
         let mut current = self.metadata.root;
 
@@ -632,6 +658,7 @@ where
         dbg!((KeyRef(&pivot), new_node_ref));
 
         // the node had to split, try insert into the parent.
+        let mut stack2 = vec![(*key, value)];
         current = loop {
             depth += 1;
 
@@ -663,21 +690,30 @@ where
             // insert into the parent, this might split again
             match self.insert_internal_node(parent, &pivot, new_node_ref)? {
                 InsertInternalState::Inserted => break parent,
-                InsertInternalState::Split(p, n) => (pivot, new_node_ref) = (p, n),
+                InsertInternalState::Split(p, n) => {
+                    stack2.push((pivot, new_node_ref));
+                    (pivot, new_node_ref) = (p, n)
+                }
             };
         };
 
         // walk back down the new set of internal nodes
         drop(stack);
-        while depth > 0 {
-            current = self.search_internal_node(current, key)?;
-            depth -= 1;
-        }
+        loop {
+            let Some((key, value)) = stack2.pop() else {
+                break Ok(None);
+            };
 
-        // insert into the leaf that now is guaranteed to have space
-        match self.must_insert_leaf_node(current, key, value)? {
-            MustInsertState::Inserted => Ok(None),
-            MustInsertState::Replaced(node_ref) => Ok(Some(node_ref)),
+            let mut depth = depth;
+            let mut current = current;
+
+            while depth > 0 {
+                current = self.search_internal_node(current, &key)?;
+                depth -= 1;
+            }
+
+            // insert into the leaf that now is guaranteed to have space
+            self.must_insert_leaf_node(current, &key, value)?;
         }
     }
 }
@@ -687,9 +723,9 @@ pub enum SearchEntry {
     Vacant(usize),
 }
 
-pub type Key = [u8; 128];
+// pub type Key = [u8; 128];
 
-pub fn key_from_u64(n: u64) -> Key {
+pub fn key_from_u64(n: u64) -> <DefaultTreeFactors as Factor>::Key {
     let mut key = [0; 128];
     key[120..].copy_from_slice(&n.to_be_bytes());
     key
@@ -700,13 +736,14 @@ pub fn key_from_u64(n: u64) -> Key {
 // with 4KiB pages, 128 byte keys and 8 byte refs, and 1 byte length
 // we could store at most 30 keys per node.
 // ======================
-const BRANCH_FACTOR: usize = 30;
+// const <DefaultTreeFactors as Factor>::Branch::<u8>::SIZE: usize = 30;
 
 #[derive(KnownLayout, IntoBytes, Unaligned, FromBytes, Immutable)]
 #[repr(C)]
-pub struct InternalNode {
-    keys: [Key; BRANCH_FACTOR],
-    values: [NodeRef; BRANCH_FACTOR + 1],
+pub struct InternalNode<F: Factor> {
+    keys: F::Branch<F::Key>,
+    min: NodeRef,
+    values: F::Branch<NodeRef>,
 
     len: u8,
     // _padding: [u8; 3],
@@ -714,10 +751,10 @@ pub struct InternalNode {
     // crc: Checksum,
 }
 
-impl InternalNode {
-    fn split_into(&mut self, rhs: &mut Self) -> Key {
+impl<F: Factor> InternalNode<F> {
+    fn split_into(&mut self, rhs: &mut Self) -> F::Key {
         debug_assert_eq!(rhs.len, 0);
-        debug_assert_eq!(self.len, BRANCH_FACTOR as u8);
+        debug_assert_eq!(self.len as usize, F::Branch::<u8>::SIZE);
 
         // orig: 30 keys, 31 values
         // ->
@@ -725,17 +762,24 @@ impl InternalNode {
         // pivot: 1 key
         // new: 14 keys, 15 values
 
-        self.len = (BRANCH_FACTOR / 2) as u8;
-        rhs.len = BRANCH_FACTOR as u8 - self.len - 1;
+        self.len = (<DefaultTreeFactors as Factor>::Branch::<u8>::SIZE / 2) as u8;
+        rhs.len = <DefaultTreeFactors as Factor>::Branch::<u8>::SIZE as u8 - self.len - 1;
 
-        let keys_pivot = self.keys[self.len as usize];
-        let keys_r = &self.keys[self.len as usize + 1..];
-        let values_r = &self.values[self.len as usize + 1..];
+        let (ka, kb) = self.keys.as_ref().split_at(self.len as usize);
+        let (kp, kb) = kb.split_first().unwrap();
+        debug_assert_eq!(ka.len(), self.len as usize);
+        debug_assert_eq!(kb.len(), rhs.len as usize);
 
-        rhs.keys[..rhs.len as usize].copy_from_slice(keys_r);
-        rhs.values[..rhs.len as usize + 1].copy_from_slice(values_r);
+        let (va, vb) = self.values.as_ref().split_at(self.len as usize);
+        let (vp, vb) = vb.split_first().unwrap();
+        debug_assert_eq!(va.len(), self.len as usize);
+        debug_assert_eq!(vb.len(), rhs.len as usize);
 
-        keys_pivot
+        rhs.keys.as_mut()[..rhs.len as usize].copy_from_slice(kb);
+        rhs.min = *vp;
+        rhs.values.as_mut()[..rhs.len as usize].copy_from_slice(vb);
+
+        *kp
     }
 }
 
@@ -757,15 +801,18 @@ pub struct LeafNode<F: Factor> {
 impl<F: Factor> LeafNode<F> {
     fn split_into(&mut self, rhs: &mut Self) -> F::Key {
         debug_assert_eq!(rhs.len, 0);
-        debug_assert_eq!(self.len, BRANCH_FACTOR as u8);
+        debug_assert_eq!(
+            self.len,
+            <DefaultTreeFactors as Factor>::Branch::<u8>::SIZE as u8
+        );
 
         // orig: 30 keys, 30 values
         // ->
         // orig: 15 keys, 15 values
         // new: 15 keys, 15 values
 
-        self.len = (BRANCH_FACTOR / 2) as u8;
-        rhs.len = BRANCH_FACTOR as u8 - self.len;
+        self.len = (<DefaultTreeFactors as Factor>::Branch::<u8>::SIZE / 2) as u8;
+        rhs.len = <DefaultTreeFactors as Factor>::Branch::<u8>::SIZE as u8 - self.len;
 
         dbg!(self.len, rhs.len);
 
