@@ -574,8 +574,7 @@ where
         dbg!((keys.iter().map(KeyRef::<F>).collect::<Vec<_>>(), values));
 
         match keys.binary_search(key) {
-            Ok(_) => unreachable!("key should not already be here"),
-            Err(0) => unreachable!("when inserting, we always split off the rhs, so this should never arrive on the left"),
+            Ok(_) => unreachable!("key {:?} should not already be here", KeyRef::<F>(key)),
             Err(i) if len < F::Branch::<u8>::SIZE => {
                 dbg!((KeyRef::<F>(key), i));
                 node.keys[i..].rotate_right(1);
@@ -583,6 +582,7 @@ where
 
                 node.keys[i] = *key;
                 node.values[i] = value;
+
                 node.len += 1;
 
                 update_checksum(&mut page);
@@ -635,7 +635,6 @@ where
 
         match keys.binary_search(key) {
             Ok(_) => unreachable!("key should not already be here"),
-            Err(0) => unreachable!("when inserting, we always split off the rhs, so this should never arrive on the left"),
             Err(i) if len < F::Branch::<u8>::SIZE => {
                 dbg!((KeyRef::<F>(key), i));
                 node.keys[i..].rotate_right(1);
@@ -939,18 +938,47 @@ mod tests {
     }
 
     #[test]
+    fn regression() {
+        let source = vec![];
+        let mut map = BTree::<_, SmallTreeFactors>::new(source).unwrap();
+
+        let x = [4, 5, 6, 7, 3, 2];
+
+        for i in x {
+            map.insert(&key_from_u642(i), node(1000 + i)).unwrap();
+
+            let tree = TreeFmt {
+                page_store: &map.page_store,
+                factor: map.factor,
+                node: map.metadata.root,
+                depth: map.metadata.depth.get(),
+            };
+            dbg!(tree);
+        }
+
+        map.insert(&key_from_u642(1), node(1001)).unwrap();
+
+        let tree = TreeFmt {
+            page_store: &map.page_store,
+            factor: map.factor,
+            node: map.metadata.root,
+            depth: map.metadata.depth.get(),
+        };
+        dbg!(tree);
+    }
+
+    #[test]
     fn check() {
         let source = vec![];
         let mut map = BTree::<_, SmallTreeFactors>::new(source).unwrap();
 
-        dbg!(size_of::<LeafNode<SmallTreeFactors>>());
-
         let mut rng = StdRng::seed_from_u64(31415);
-        let mut x = (1..=8).collect::<Vec<_>>();
+        let mut x = (1..=60).collect::<Vec<_>>();
         x.shuffle(&mut rng);
         dbg!(&x);
 
         for i in x {
+            dbg!(("insert", i));
             map.insert(&key_from_u642(i), node(1000 + i)).unwrap();
 
             let tree = TreeFmt {
