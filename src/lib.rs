@@ -199,14 +199,14 @@ impl<S: PageSource> BTree<S> {
             return Ok(());
         }
 
-        self.validate_tree_bounds(current, depth, ..)
+        self.validate_tree_bounds(current, depth, (Bound::Unbounded, Bound::Unbounded))
     }
 
     pub fn validate_tree_bounds(
         &self,
         node_ref: NodeRef,
         depth: u64,
-        bounds: impl RangeBounds<Key>,
+        bounds: (Bound<&Key>, Bound<&Key>),
     ) -> io::Result<()> {
         let page = self.page_store.must_read(node_ref)?;
         validate_page(&page)?;
@@ -219,28 +219,42 @@ impl<S: PageSource> BTree<S> {
             let keys = &node.keys[..len];
             let values = &node.values[..len + 1];
 
+            if !keys.is_sorted() {
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("invalid tree ordering: unsorted keys. {node_ref:?} depth={depth}"),
+                ));
+            }
+
             for key in keys {
                 if !bounds.contains(key) {
                     return Err(io::Error::new(
                         io::ErrorKind::Other,
-                        format!("invalid tree ordering: {node_ref:?} depth={depth}"),
+                        format!("invalid tree ordering: key out of bounds of parent node. {node_ref:?} depth={depth}"),
                     ));
                 }
             }
 
-            self.validate_tree_bounds(
-                values[0],
-                depth - 1,
-                (bounds.start_bound(), Bound::Excluded(&keys[0])),
-            )?;
-            for i in 0..len - 1 {
-                self.validate_tree_bounds(values[i + 1], depth - 1, keys[i]..keys[i + 1])?;
+            if let Bound::Included(start) = bounds.0 {
+                if &keys[0] != start {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        format!("invalid tree ordering: first key not in line with parent pivot. {node_ref:?} depth={depth}"),
+                    ));
+                }
             }
-            self.validate_tree_bounds(
-                values[len],
-                depth - 1,
-                (Bound::Excluded(&keys[len - 1]), bounds.end_bound()),
-            )?;
+
+            self.validate_tree_bounds(values[0], depth - 1, (bounds.0, Bound::Excluded(&keys[0])))?;
+            for i in 1..=len {
+                self.validate_tree_bounds(
+                    values[i],
+                    depth - 1,
+                    (
+                        Bound::Included(&keys[i - 1]),
+                        keys.get(i).map_or(bounds.1, Bound::Excluded),
+                    ),
+                )?;
+            }
         } else {
             let node = LeafNode::ref_from_bytes(&page)
                 .expect("all 4k pages should cast exactly to an LeafNode");
@@ -248,11 +262,18 @@ impl<S: PageSource> BTree<S> {
             let len = node.len as usize;
             let keys = &node.keys[..len];
 
+            if !keys.is_sorted() {
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("invalid tree ordering: unsorted keys. {node_ref:?} depth={depth}"),
+                ));
+            }
+
             for key in keys {
                 if !bounds.contains(key) {
                     return Err(io::Error::new(
                         io::ErrorKind::Other,
-                        "invalid tree ordering",
+                        format!("invalid tree ordering: key out of bounds of parent node. {node_ref:?} depth={depth}"),
                     ));
                 }
             }
@@ -269,8 +290,10 @@ impl<S: PageSource> BTree<S> {
             .expect("all 4k pages should cast exactly to an InternalNode");
         let len = node.len as usize;
         let keys = &node.keys[..len];
-        let (Ok(i) | Err(i)) = keys.binary_search(key);
-        Ok(node.values[i])
+        match keys.binary_search(key) {
+            Ok(i) => Ok(node.values[i + 1]),
+            Err(i) => Ok(node.values[i]),
+        }
     }
 
     fn search_leaf_node(&self, node: NodeRef, key: &Key) -> io::Result<SearchEntry> {
