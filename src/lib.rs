@@ -88,7 +88,7 @@ impl<S: PageSource<F::Page>, F: Factor> BTree<S, F> {
         })
     }
 
-    fn search_internal_node(&self, node_ref: NodeRef, key: &F::Key) -> io::Result<NodeRef> {
+    fn search_internal_node(&self, node_ref: HeapPtr, key: &F::Key) -> io::Result<HeapPtr> {
         let page = self.page_store.must_read(node_ref)?;
         let node = validate_page::<InternalNode<F>, F::Page>(&page)?;
 
@@ -101,7 +101,7 @@ impl<S: PageSource<F::Page>, F: Factor> BTree<S, F> {
         }
     }
 
-    fn search_leaf_node(&self, node: NodeRef, key: &F::Key) -> io::Result<SearchEntry> {
+    fn search_leaf_node(&self, node: HeapPtr, key: &F::Key) -> io::Result<SearchEntry> {
         let page = self.page_store.must_read(node)?;
         let node = validate_page::<LeafNode<F>, F::Page>(&page)?;
 
@@ -113,7 +113,7 @@ impl<S: PageSource<F::Page>, F: Factor> BTree<S, F> {
         }
     }
 
-    pub fn search(&self, key: &F::Key) -> io::Result<Option<NodeRef>> {
+    pub fn search(&self, key: &F::Key) -> io::Result<Option<HeapPtr>> {
         let mut depth = self.metadata.depth.get();
         let mut current = self.metadata.root;
 
@@ -136,13 +136,13 @@ impl<S: PageSource<F::Page>, F: Factor> BTree<S, F> {
 
 enum InsertState<F: Factor> {
     Inserted,
-    Replaced(NodeRef),
-    Split(F::Key, NodeRef),
+    Replaced(HeapPtr),
+    Split(F::Key, HeapPtr),
 }
 
 enum InsertInternalState<F: Factor> {
     Inserted,
-    Split(F::Key, NodeRef),
+    Split(F::Key, HeapPtr),
 }
 
 impl<S, F> BTree<S, F>
@@ -150,20 +150,26 @@ where
     S: PageSink<F::Page>,
     F: Factor,
 {
-    fn allocate(&mut self) -> io::Result<NodeRef> {
+    fn allocate(&mut self) -> io::Result<HeapPtr> {
         // todo: use freelist
 
+        // skip the first page reserved for metadata.
         if self.metadata.len == 0 {
             self.metadata.len += 1;
         }
-        self.metadata.len += 1;
-        let x = NodeRef {
-            offset: little_endian::U64::new(self.metadata.len.get() - 1),
-        };
 
+        let index = self.metadata.len.get();
+        let page_size = u64::try_from(F::Page::SIZE).unwrap();
+        let offset = index
+            .checked_mul(page_size)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::OutOfMemory, "page offset overflowed u64"))?;
+
+        self.metadata.len += 1;
         self.update_metadata()?;
 
-        Ok(x)
+        Ok(HeapPtr {
+            offset: little_endian::U64::new(offset),
+        })
     }
 
     fn update_metadata(&mut self) -> io::Result<()> {
@@ -174,9 +180,9 @@ where
 
     fn insert_leaf_node(
         &mut self,
-        page_ref: NodeRef,
+        page_ref: HeapPtr,
         key: &F::Key,
-        value: NodeRef,
+        value: HeapPtr,
     ) -> io::Result<InsertState<F>> {
         let mut page = self.page_store.must_read(page_ref)?;
         let node = validate_page_mut::<LeafNode<F>, F::Page>(&mut page)?;
@@ -217,9 +223,9 @@ where
 
     fn must_insert_leaf_node(
         &mut self,
-        page_ref: NodeRef,
+        page_ref: HeapPtr,
         key: &F::Key,
-        value: NodeRef,
+        value: HeapPtr,
     ) -> io::Result<()> {
         let mut page = self.page_store.must_read(page_ref)?;
         let node = validate_page_mut::<LeafNode<F>, F::Page>(&mut page)?;
@@ -240,9 +246,9 @@ where
 
     fn insert_internal_node(
         &mut self,
-        page_ref: NodeRef,
+        page_ref: HeapPtr,
         key: &F::Key,
-        value: NodeRef,
+        value: HeapPtr,
     ) -> io::Result<InsertInternalState<F>> {
         let mut page = self.page_store.must_read(page_ref)?;
         let node = validate_page_mut::<InternalNode<F>, F::Page>(&mut page)?;
@@ -279,9 +285,9 @@ where
 
     fn must_insert_internal_node(
         &mut self,
-        page_ref: NodeRef,
+        page_ref: HeapPtr,
         key: &F::Key,
-        value: NodeRef,
+        value: HeapPtr,
     ) -> io::Result<()> {
         let mut page = self.page_store.must_read(page_ref)?;
         let node = validate_page_mut::<InternalNode<F>, F::Page>(&mut page)?;
@@ -301,7 +307,7 @@ where
     }
 
     // returns the old NodeRef if there was one.
-    pub fn insert(&mut self, key: &F::Key, value: NodeRef) -> io::Result<Option<NodeRef>> {
+    pub fn insert(&mut self, key: &F::Key, value: HeapPtr) -> io::Result<Option<HeapPtr>> {
         let mut depth = self.metadata.depth.get();
         let mut current = self.metadata.root;
 
@@ -403,7 +409,7 @@ where
 }
 
 pub enum SearchEntry {
-    Occupied(usize, NodeRef),
+    Occupied(usize, HeapPtr),
     Vacant(usize),
 }
 
@@ -411,8 +417,8 @@ pub enum SearchEntry {
 #[repr(C)]
 pub struct InternalNode<F: Factor> {
     keys: F::Branch<F::Key>,
-    min: NodeRef,
-    values: F::Branch<NodeRef>,
+    min: HeapPtr,
+    values: F::Branch<HeapPtr>,
 
     len: little_endian::U16,
 }
@@ -441,7 +447,7 @@ impl<F: Factor> InternalNode<F> {
         *keys_p
     }
 
-    fn insert(&mut self, i: usize, key: F::Key, value: NodeRef) {
+    fn insert(&mut self, i: usize, key: F::Key, value: HeapPtr) {
         self.keys[i..].rotate_right(1);
         self.values[i..].rotate_right(1);
 
@@ -456,7 +462,7 @@ impl<F: Factor> InternalNode<F> {
 #[repr(C)]
 pub struct LeafNode<F: Factor> {
     keys: F::Branch<F::Key>,
-    values: F::Branch<NodeRef>,
+    values: F::Branch<HeapPtr>,
 
     // /// represents a doubly linked list of leaf nodes.
     // /// we only had space for 1 pointer, so this is an xor link.
@@ -486,7 +492,7 @@ impl<F: Factor> LeafNode<F> {
         *keys_p
     }
 
-    fn insert(&mut self, i: usize, key: F::Key, value: NodeRef) {
+    fn insert(&mut self, i: usize, key: F::Key, value: HeapPtr) {
         self.keys[i..].rotate_right(1);
         self.values[i..].rotate_right(1);
 
@@ -515,26 +521,38 @@ struct FileMetadata {
     len: little_endian::U64,
 
     // the tree root
-    root: NodeRef,
+    root: HeapPtr,
     depth: little_endian::U64,
 
     // a doubly linked list for the free pages
-    free_head: NodeRef,
-    free_tail: NodeRef,
+    free_head: HeapPtr,
+    free_tail: HeapPtr,
 }
 
 /// Reserved for the file metadata.
 /// In any other position it is a "None" value.
 /// Can be used to indicate that no entry is present.
-const NODE_SENTINAL: NodeRef = NodeRef {
+const NODE_SENTINAL: HeapPtr = HeapPtr {
     offset: little_endian::U64::new(0),
 };
 
 #[derive(KnownLayout, IntoBytes, Unaligned, Immutable, FromBytes, Clone, Copy, PartialEq)]
 #[repr(transparent)]
-pub struct NodeRef {
+pub struct HeapPtr {
     offset: little_endian::U64,
 }
+
+#[derive(KnownLayout, IntoBytes, Unaligned, Immutable, FromBytes, Clone, Copy, PartialEq)]
+#[repr(transparent)]
+pub struct NodePtr(HeapPtr);
+
+#[derive(KnownLayout, IntoBytes, Unaligned, Immutable, FromBytes, Clone, Copy, PartialEq)]
+#[repr(transparent)]
+pub struct LeafPtr(NodePtr);
+
+#[derive(KnownLayout, IntoBytes, Unaligned, Immutable, FromBytes, Clone, Copy, PartialEq)]
+#[repr(transparent)]
+pub struct InternalPtr(NodePtr);
 
 #[cfg(test)]
 mod tests {
@@ -543,10 +561,10 @@ mod tests {
     use rand::{rngs::StdRng, Rng, SeedableRng};
     use zerocopy::little_endian;
 
-    use crate::{BTree, DefaultTreeFactors, Factor, NodeRef};
+    use crate::{BTree, DefaultTreeFactors, Factor, HeapPtr};
 
-    pub fn node(n: u64) -> NodeRef {
-        crate::NodeRef {
+    pub fn node(n: u64) -> HeapPtr {
+        crate::HeapPtr {
             offset: little_endian::U64::new(n),
         }
     }

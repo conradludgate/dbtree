@@ -3,29 +3,25 @@ use std::{
     io::{self, Read, Seek, Write},
 };
 
-use crate::{array::Array, NodeRef};
+use crate::{array::Array, HeapPtr};
 
 use super::{PageSink, PageSource};
 
 impl<Page: Array<u8>> PageSource<Page> for File {
-    fn read(&self, page_ref: NodeRef) -> io::Result<Option<Page>> {
+    fn read(&self, page_ref: HeapPtr) -> io::Result<Option<Page>> {
         <&File as PageSource<Page>>::read(&self, page_ref)
     }
 }
 
 impl<Page: Array<u8>> PageSink<Page> for File {
-    fn write(&mut self, page_ref: NodeRef, page: &Page) -> io::Result<()> {
+    fn write(&mut self, page_ref: HeapPtr, page: &Page) -> io::Result<()> {
         <&File as PageSink<Page>>::write(&mut &*self, page_ref, page)
     }
 }
 
 impl<Page: Array<u8>> PageSource<Page> for &File {
-    fn read(&self, page_ref: NodeRef) -> io::Result<Option<Page>> {
-        let size =
-            u64::try_from(Page::SIZE).map_err(|e| io::Error::new(io::ErrorKind::OutOfMemory, e))?;
-        let offset = page_ref.offset.get().checked_mul(size).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::UnexpectedEof, "page offset overflowed u64")
-        })?;
+    fn read(&self, page_ref: HeapPtr) -> io::Result<Option<Page>> {
+        let offset = page_ref.offset.get();
 
         if self.metadata()?.len() <= offset {
             return Ok(None);
@@ -42,15 +38,9 @@ impl<Page: Array<u8>> PageSource<Page> for &File {
 }
 
 impl<Page: Array<u8>> PageSink<Page> for &File {
-    fn write(&mut self, page_ref: NodeRef, page: &Page) -> io::Result<()> {
-        let size =
-            u64::try_from(Page::SIZE).map_err(|e| io::Error::new(io::ErrorKind::OutOfMemory, e))?;
-        let offset = page_ref.offset.get().checked_mul(size).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::UnexpectedEof, "page offset overflowed u64")
-        })?;
-
+    fn write(&mut self, page_ref: HeapPtr, page: &Page) -> io::Result<()> {
         let mut this = *self;
-        this.seek(io::SeekFrom::Start(offset))?;
+        this.seek(io::SeekFrom::Start(page_ref.offset.get()))?;
         this.write_all(page.as_bytes())?;
 
         Ok(())
@@ -65,10 +55,10 @@ mod tests {
     use tempfile::NamedTempFile;
     use zerocopy::little_endian;
 
-    use crate::{BTree, DefaultTreeFactors, Factor, NodeRef};
+    use crate::{BTree, DefaultTreeFactors, Factor, HeapPtr};
 
-    pub fn node(n: u64) -> NodeRef {
-        crate::NodeRef {
+    pub fn node(n: u64) -> HeapPtr {
+        crate::HeapPtr {
             offset: little_endian::U64::new(n),
         }
     }

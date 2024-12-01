@@ -8,14 +8,14 @@ use std::{
 use zerocopy::{big_endian, FromBytes, IntoBytes};
 
 use crate::{
-    checksum::validate_page, source::PageSource, BTree, Factor, InternalNode, LeafNode, NodeRef, NODE_SENTINAL
+    checksum::validate_page, source::PageSource, BTree, Factor, InternalNode, LeafNode, HeapPtr, NODE_SENTINAL
 };
 
 #[allow(dead_code)]
 struct TreeFmt<'a, S, F: Factor> {
     page_store: &'a S,
     factor: PhantomData<F>,
-    node: NodeRef,
+    node: HeapPtr,
     depth: u64,
 }
 
@@ -110,7 +110,7 @@ impl<S: PageSource<F::Page>, F: Factor> BTree<S, F> {
 
     pub fn validate_tree_bounds(
         &self,
-        node_ref: NodeRef,
+        node_ref: HeapPtr,
         depth: u64,
         bounds: (Bound<&F::Key>, Bound<&F::Key>),
     ) -> io::Result<()> {
@@ -195,7 +195,7 @@ impl<S: PageSource<F::Page>, F: Factor> BTree<S, F> {
     }
 }
 
-impl fmt::Debug for NodeRef {
+impl fmt::Debug for HeapPtr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.offset.get().fmt(f)
     }
