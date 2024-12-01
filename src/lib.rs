@@ -88,8 +88,9 @@ impl<S: PageSource<F::Page>, F: Factor> BTree<S, F> {
         })
     }
 
-    fn search_internal_node(&self, node_ref: HeapPtr, key: &F::Key) -> io::Result<HeapPtr> {
-        let page = self.page_store.must_read(node_ref)?;
+    fn search_internal_node(&self, node_ref: InternalPtr, key: &F::Key) -> io::Result<NodePtr> {
+        let InternalPtr(NodePtr(heap_ptr)) = node_ref;
+        let page = self.page_store.must_read(heap_ptr)?;
         let node = validate_page::<InternalNode<F>, F::Page>(&page)?;
 
         let len = node.len.get() as usize;
@@ -101,8 +102,9 @@ impl<S: PageSource<F::Page>, F: Factor> BTree<S, F> {
         }
     }
 
-    fn search_leaf_node(&self, node: HeapPtr, key: &F::Key) -> io::Result<SearchEntry> {
-        let page = self.page_store.must_read(node)?;
+    fn search_leaf_node(&self, node: LeafPtr, key: &F::Key) -> io::Result<SearchEntry> {
+        let LeafPtr(NodePtr(heap_ptr)) = node;
+        let page = self.page_store.must_read(heap_ptr)?;
         let node = validate_page::<LeafNode<F>, F::Page>(&page)?;
 
         let len = node.len.get() as usize;
@@ -118,16 +120,16 @@ impl<S: PageSource<F::Page>, F: Factor> BTree<S, F> {
         let mut current = self.metadata.root;
 
         // the btree is currently empty.
-        if current == NODE_SENTINAL {
+        if current.0 == NODE_SENTINAL {
             return Ok(None);
         }
 
         // walk through the internal nodes until we find the correct leaf
         while depth > 0 {
-            current = self.search_internal_node(current, key)?;
+            current = self.search_internal_node(InternalPtr(current), key)?;
             depth -= 1;
         }
-        match self.search_leaf_node(current, key)? {
+        match self.search_leaf_node(LeafPtr(current), key)? {
             SearchEntry::Occupied(_, node_ref) => Ok(Some(node_ref)),
             SearchEntry::Vacant(_) => Ok(None),
         }
@@ -137,12 +139,12 @@ impl<S: PageSource<F::Page>, F: Factor> BTree<S, F> {
 enum InsertState<F: Factor> {
     Inserted,
     Replaced(HeapPtr),
-    Split(F::Key, HeapPtr),
+    Split(F::Key, LeafPtr),
 }
 
 enum InsertInternalState<F: Factor> {
     Inserted,
-    Split(F::Key, HeapPtr),
+    Split(F::Key, InternalPtr),
 }
 
 impl<S, F> BTree<S, F>
@@ -160,9 +162,9 @@ where
 
         let index = self.metadata.len.get();
         let page_size = u64::try_from(F::Page::SIZE).unwrap();
-        let offset = index
-            .checked_mul(page_size)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::OutOfMemory, "page offset overflowed u64"))?;
+        let offset = index.checked_mul(page_size).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::OutOfMemory, "page offset overflowed u64")
+        })?;
 
         self.metadata.len += 1;
         self.update_metadata()?;
@@ -180,11 +182,12 @@ where
 
     fn insert_leaf_node(
         &mut self,
-        page_ref: HeapPtr,
+        page_ref: LeafPtr,
         key: &F::Key,
         value: HeapPtr,
     ) -> io::Result<InsertState<F>> {
-        let mut page = self.page_store.must_read(page_ref)?;
+        let LeafPtr(NodePtr(heap_ptr)) = page_ref;
+        let mut page = self.page_store.must_read(heap_ptr)?;
         let node = validate_page_mut::<LeafNode<F>, F::Page>(&mut page)?;
 
         let len = node.len.get() as usize;
@@ -193,17 +196,17 @@ where
         match keys.binary_search(key) {
             Ok(i) => {
                 let old_value = std::mem::replace(&mut node.values[i], value);
-                self.page_store.write_page(page_ref, &mut page)?;
+                self.page_store.write_page(heap_ptr, &mut page)?;
                 Ok(InsertState::Replaced(old_value))
             }
             Err(i) if len < F::Branch::<u8>::SIZE => {
                 node.insert(i, *key, value);
-                self.page_store.write_page(page_ref, &mut page)?;
+                self.page_store.write_page(heap_ptr, &mut page)?;
                 Ok(InsertState::Inserted)
             }
             // overflow
             Err(_) => {
-                let new_page_ref = self.allocate()?;
+                let new_heap_ptr = self.allocate()?;
                 let mut new_page = F::Page::new_zeroed();
 
                 let pivot = {
@@ -213,21 +216,22 @@ where
                     node.split_into(new_node)
                 };
 
-                self.page_store.write_page(page_ref, &mut page)?;
-                self.page_store.write_page(new_page_ref, &mut new_page)?;
+                self.page_store.write_page(heap_ptr, &mut page)?;
+                self.page_store.write_page(new_heap_ptr, &mut new_page)?;
 
-                Ok(InsertState::Split(pivot, new_page_ref))
+                Ok(InsertState::Split(pivot, LeafPtr(NodePtr(new_heap_ptr))))
             }
         }
     }
 
     fn must_insert_leaf_node(
         &mut self,
-        page_ref: HeapPtr,
+        page_ref: LeafPtr,
         key: &F::Key,
         value: HeapPtr,
     ) -> io::Result<()> {
-        let mut page = self.page_store.must_read(page_ref)?;
+        let LeafPtr(NodePtr(heap_ptr)) = page_ref;
+        let mut page = self.page_store.must_read(heap_ptr)?;
         let node = validate_page_mut::<LeafNode<F>, F::Page>(&mut page)?;
 
         let len = node.len.get() as usize;
@@ -237,7 +241,7 @@ where
             Ok(_) => unreachable!(),
             Err(i) if len < F::Branch::<u8>::SIZE => {
                 node.insert(i, *key, value);
-                self.page_store.write_page(page_ref, &mut page)?;
+                self.page_store.write_page(heap_ptr, &mut page)?;
                 Ok(())
             }
             Err(_) => unreachable!("btree insert must not overflow"),
@@ -246,11 +250,12 @@ where
 
     fn insert_internal_node(
         &mut self,
-        page_ref: HeapPtr,
+        page_ref: InternalPtr,
         key: &F::Key,
-        value: HeapPtr,
+        value: NodePtr,
     ) -> io::Result<InsertInternalState<F>> {
-        let mut page = self.page_store.must_read(page_ref)?;
+        let InternalPtr(NodePtr(heap_ptr)) = page_ref;
+        let mut page = self.page_store.must_read(heap_ptr)?;
         let node = validate_page_mut::<InternalNode<F>, F::Page>(&mut page)?;
 
         let len = node.len.get() as usize;
@@ -260,12 +265,12 @@ where
             Ok(_) => unreachable!("if we are inserting an internal node, it is because this key wasn't in the tree and a leaf node had to split."),
             Err(i) if len < F::Branch::<u8>::SIZE => {
                 node.insert(i, *key, value);
-                self.page_store.write_page(page_ref, &mut page)?;
+                self.page_store.write_page(heap_ptr, &mut page)?;
                 Ok(InsertInternalState::Inserted)
             }
             // overflow
             Err(_) => {
-                let new_page_ref = self.allocate()?;
+                let new_heap_ptr = self.allocate()?;
                 let mut new_page = F::Page::new_zeroed();
 
                 let pivot = {
@@ -275,21 +280,22 @@ where
                     node.split_into(new_node)
                 };
 
-                self.page_store.write_page(page_ref, &mut page)?;
-                self.page_store.write_page(new_page_ref, &mut page)?;
+                self.page_store.write_page(heap_ptr, &mut page)?;
+                self.page_store.write_page(new_heap_ptr, &mut page)?;
 
-                Ok(InsertInternalState::Split(pivot, new_page_ref))
+                Ok(InsertInternalState::Split(pivot, InternalPtr(NodePtr(new_heap_ptr))))
             }
         }
     }
 
     fn must_insert_internal_node(
         &mut self,
-        page_ref: HeapPtr,
+        page_ref: InternalPtr,
         key: &F::Key,
-        value: HeapPtr,
+        value: NodePtr,
     ) -> io::Result<()> {
-        let mut page = self.page_store.must_read(page_ref)?;
+        let InternalPtr(NodePtr(heap_ptr)) = page_ref;
+        let mut page = self.page_store.must_read(heap_ptr)?;
         let node = validate_page_mut::<InternalNode<F>, F::Page>(&mut page)?;
 
         let len = node.len.get() as usize;
@@ -299,7 +305,7 @@ where
             Ok(_) => unreachable!("key should not already be here"),
             Err(i) if len < F::Branch::<u8>::SIZE => {
                 node.insert(i, *key, value);
-                self.page_store.write_page(page_ref, &mut page)?;
+                self.page_store.write_page(heap_ptr, &mut page)?;
                 Ok(())
             }
             Err(_) => unreachable!("btree insert must not overflow"),
@@ -313,7 +319,7 @@ where
 
         // the btree is currently empty.
         // allocate a new empty root.
-        if current == NODE_SENTINAL {
+        if current.0 == NODE_SENTINAL {
             let root_page_ref = self.allocate()?;
 
             let mut page = F::Page::new_zeroed();
@@ -324,30 +330,31 @@ where
 
             self.page_store.write_page(root_page_ref, &mut page)?;
 
-            self.metadata.root = root_page_ref;
+            self.metadata.root = NodePtr(root_page_ref);
             self.update_metadata()?;
 
-            current = root_page_ref;
+            current = NodePtr(root_page_ref);
         }
 
         // walk through the internal nodes until we find the correct leaf
         let mut stack = vec![];
         while depth > 0 {
-            stack.push(current);
-            current = self.search_internal_node(current, key)?;
+            stack.push(InternalPtr(current));
+            current = self.search_internal_node(InternalPtr(current), key)?;
             depth -= 1;
         }
 
         // try insert into the leaf
-        let (mut pivot, mut new_node_ref) = match self.insert_leaf_node(current, key, value)? {
-            InsertState::Inserted => return Ok(None),
-            InsertState::Replaced(node_ref) => return Ok(Some(node_ref)),
-            InsertState::Split(pivot, new_node_ref) => (pivot, new_node_ref),
-        };
+        let (mut pivot, LeafPtr(mut new_node_ref)) =
+            match self.insert_leaf_node(LeafPtr(current), key, value)? {
+                InsertState::Inserted => return Ok(None),
+                InsertState::Replaced(node_ref) => return Ok(Some(node_ref)),
+                InsertState::Split(pivot, new_node_ref) => (pivot, new_node_ref),
+            };
 
         // the node had to split, try insert into the parent.
         let mut stack2 = vec![(*key, value, depth)];
-        current = loop {
+        let InternalPtr(mut current) = loop {
             depth += 1;
 
             let Some(parent) = stack.pop() else {
@@ -368,18 +375,18 @@ where
                     self.page_store.write_page(root_page_ref, &mut page)?;
                 }
 
-                self.metadata.root = root_page_ref;
+                self.metadata.root = NodePtr(root_page_ref);
                 self.metadata.depth += 1;
                 self.update_metadata()?;
 
-                break root_page_ref;
+                break InternalPtr(NodePtr(root_page_ref));
             };
 
             // insert into the parent, this might split again
             match self.insert_internal_node(parent, &pivot, new_node_ref)? {
                 InsertInternalState::Inserted => break parent,
-                InsertInternalState::Split(p, n) => {
-                    stack2.push((pivot, new_node_ref, depth));
+                InsertInternalState::Split(p, InternalPtr(n)) => {
+                    stack2.push((pivot, new_node_ref.0, depth));
                     (pivot, new_node_ref) = (p, n)
                 }
             };
@@ -393,16 +400,16 @@ where
             };
 
             while depth > d {
-                current = self.search_internal_node(current, &key)?;
+                current = self.search_internal_node(InternalPtr(current), &key)?;
                 depth -= 1;
             }
 
             if d > 0 {
                 // insert into the leaf that now is guaranteed to have space
-                self.must_insert_internal_node(current, &key, value)?;
+                self.must_insert_internal_node(InternalPtr(current), &key, NodePtr(value))?;
             } else {
                 // insert into the leaf that now is guaranteed to have space
-                self.must_insert_leaf_node(current, &key, value)?;
+                self.must_insert_leaf_node(LeafPtr(current), &key, value)?;
             }
         }
     }
@@ -417,8 +424,8 @@ pub enum SearchEntry {
 #[repr(C)]
 pub struct InternalNode<F: Factor> {
     keys: F::Branch<F::Key>,
-    min: HeapPtr,
-    values: F::Branch<HeapPtr>,
+    min: NodePtr,
+    values: F::Branch<NodePtr>,
 
     len: little_endian::U16,
 }
@@ -447,7 +454,7 @@ impl<F: Factor> InternalNode<F> {
         *keys_p
     }
 
-    fn insert(&mut self, i: usize, key: F::Key, value: HeapPtr) {
+    fn insert(&mut self, i: usize, key: F::Key, value: NodePtr) {
         self.keys[i..].rotate_right(1);
         self.values[i..].rotate_right(1);
 
@@ -521,7 +528,7 @@ struct FileMetadata {
     len: little_endian::U64,
 
     // the tree root
-    root: HeapPtr,
+    root: NodePtr,
     depth: little_endian::U64,
 
     // a doubly linked list for the free pages

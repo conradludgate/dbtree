@@ -8,24 +8,25 @@ use std::{
 use zerocopy::{big_endian, FromBytes, IntoBytes};
 
 use crate::{
-    checksum::validate_page, source::PageSource, BTree, Factor, InternalNode, LeafNode, HeapPtr, NODE_SENTINAL
+    checksum::validate_page, source::PageSource, BTree, Factor, HeapPtr, InternalNode, InternalPtr,
+    LeafNode, LeafPtr, NodePtr, NODE_SENTINAL,
 };
 
 #[allow(dead_code)]
 struct TreeFmt<'a, S, F: Factor> {
     page_store: &'a S,
     factor: PhantomData<F>,
-    node: HeapPtr,
+    node: NodePtr,
     depth: u64,
 }
 
 impl<S: PageSource<F::Page>, F: Factor> fmt::Debug for TreeFmt<'_, S, F> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.node == NODE_SENTINAL {
+        if self.node.0 == NODE_SENTINAL {
             return f.debug_map().finish();
         }
 
-        let page = self.page_store.must_read(self.node).unwrap();
+        let page = self.page_store.must_read(self.node.0).unwrap();
 
         if self.depth > 0 {
             let (node, _) = InternalNode::<F>::ref_from_prefix(page.as_bytes())
@@ -101,7 +102,7 @@ impl<S: PageSource<F::Page>, F: Factor> BTree<S, F> {
         let current = self.metadata.root;
 
         // the btree is currently empty.
-        if current == NODE_SENTINAL {
+        if current.0 == NODE_SENTINAL {
             return Ok(());
         }
 
@@ -110,11 +111,11 @@ impl<S: PageSource<F::Page>, F: Factor> BTree<S, F> {
 
     pub fn validate_tree_bounds(
         &self,
-        node_ref: HeapPtr,
+        node_ref: NodePtr,
         depth: u64,
         bounds: (Bound<&F::Key>, Bound<&F::Key>),
     ) -> io::Result<()> {
-        let page = self.page_store.must_read(node_ref)?;
+        let page = self.page_store.must_read(node_ref.0)?;
 
         if depth > 0 {
             let node = validate_page::<InternalNode<F>, F::Page>(&page)?;
@@ -198,5 +199,23 @@ impl<S: PageSource<F::Page>, F: Factor> BTree<S, F> {
 impl fmt::Debug for HeapPtr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.offset.get().fmt(f)
+    }
+}
+
+impl fmt::Debug for NodePtr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl fmt::Debug for LeafPtr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl fmt::Debug for InternalPtr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
     }
 }
