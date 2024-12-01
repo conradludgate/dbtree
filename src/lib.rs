@@ -89,7 +89,7 @@ impl<S: PageSource<F::Page>, F: Factor> BTree<S, F> {
     }
 
     fn search_internal_node(&self, node_ref: InternalPtr, key: &F::Key) -> io::Result<NodePtr> {
-        let InternalPtr(NodePtr(heap_ptr)) = node_ref;
+        let NodePtr(heap_ptr) = node_ref.node();
         let page = self.page_store.must_read(heap_ptr)?;
         let node = validate_page::<InternalNode<F>, F::Page>(&page)?;
 
@@ -103,7 +103,7 @@ impl<S: PageSource<F::Page>, F: Factor> BTree<S, F> {
     }
 
     fn search_leaf_node(&self, node: LeafPtr, key: &F::Key) -> io::Result<SearchEntry> {
-        let LeafPtr(NodePtr(heap_ptr)) = node;
+        let NodePtr(heap_ptr) = node.node();
         let page = self.page_store.must_read(heap_ptr)?;
         let node = validate_page::<LeafNode<F>, F::Page>(&page)?;
 
@@ -126,10 +126,10 @@ impl<S: PageSource<F::Page>, F: Factor> BTree<S, F> {
 
         // walk through the internal nodes until we find the correct leaf
         while depth > 0 {
-            current = self.search_internal_node(InternalPtr(current), key)?;
+            current = self.search_internal_node(current.assert_is_internal(), key)?;
             depth -= 1;
         }
-        match self.search_leaf_node(LeafPtr(current), key)? {
+        match self.search_leaf_node(current.assert_is_leaf(), key)? {
             SearchEntry::Occupied(_, node_ref) => Ok(Some(node_ref)),
             SearchEntry::Vacant(_) => Ok(None),
         }
@@ -186,7 +186,7 @@ where
         key: &F::Key,
         value: HeapPtr,
     ) -> io::Result<InsertState<F>> {
-        let LeafPtr(NodePtr(heap_ptr)) = page_ref;
+        let NodePtr(heap_ptr) = page_ref.node();
         let mut page = self.page_store.must_read(heap_ptr)?;
         let node = validate_page_mut::<LeafNode<F>, F::Page>(&mut page)?;
 
@@ -219,7 +219,10 @@ where
                 self.page_store.write_page(heap_ptr, &mut page)?;
                 self.page_store.write_page(new_heap_ptr, &mut new_page)?;
 
-                Ok(InsertState::Split(pivot, LeafPtr(NodePtr(new_heap_ptr))))
+                Ok(InsertState::Split(
+                    pivot,
+                    NodePtr(new_heap_ptr).assert_is_leaf(),
+                ))
             }
         }
     }
@@ -230,7 +233,7 @@ where
         key: &F::Key,
         value: HeapPtr,
     ) -> io::Result<()> {
-        let LeafPtr(NodePtr(heap_ptr)) = page_ref;
+        let NodePtr(heap_ptr) = page_ref.node();
         let mut page = self.page_store.must_read(heap_ptr)?;
         let node = validate_page_mut::<LeafNode<F>, F::Page>(&mut page)?;
 
@@ -254,7 +257,7 @@ where
         key: &F::Key,
         value: NodePtr,
     ) -> io::Result<InsertInternalState<F>> {
-        let InternalPtr(NodePtr(heap_ptr)) = page_ref;
+        let NodePtr(heap_ptr) = page_ref.node();
         let mut page = self.page_store.must_read(heap_ptr)?;
         let node = validate_page_mut::<InternalNode<F>, F::Page>(&mut page)?;
 
@@ -283,7 +286,7 @@ where
                 self.page_store.write_page(heap_ptr, &mut page)?;
                 self.page_store.write_page(new_heap_ptr, &mut page)?;
 
-                Ok(InsertInternalState::Split(pivot, InternalPtr(NodePtr(new_heap_ptr))))
+                Ok(InsertInternalState::Split(pivot, NodePtr(new_heap_ptr).assert_is_internal()))
             }
         }
     }
@@ -294,7 +297,7 @@ where
         key: &F::Key,
         value: NodePtr,
     ) -> io::Result<()> {
-        let InternalPtr(NodePtr(heap_ptr)) = page_ref;
+        let NodePtr(heap_ptr) = page_ref.node();
         let mut page = self.page_store.must_read(heap_ptr)?;
         let node = validate_page_mut::<InternalNode<F>, F::Page>(&mut page)?;
 
@@ -339,20 +342,23 @@ where
         // walk through the internal nodes until we find the correct leaf
         let mut search_stack = vec![];
         while depth > 0 {
-            search_stack.push(InternalPtr(current));
-            current = self.search_internal_node(InternalPtr(current), key)?;
+            let c = current.assert_is_internal();
+            search_stack.push(c);
+            current = self.search_internal_node(c, key)?;
             depth -= 1;
         }
 
+        let leaf = current.assert_is_leaf();
+
         // try insert into the leaf
-        let (mut pivot, LeafPtr(mut new_node_ref)) =
-            match self.insert_leaf_node(LeafPtr(current), key, value)? {
-                InsertState::Inserted => return Ok(None),
-                InsertState::Replaced(node_ref) => return Ok(Some(node_ref)),
-                InsertState::Split(pivot, new_node_ref) => (pivot, new_node_ref),
-            };
+        let (mut pivot, new_node_ref) = match self.insert_leaf_node(leaf, key, value)? {
+            InsertState::Inserted => return Ok(None),
+            InsertState::Replaced(node_ref) => return Ok(Some(node_ref)),
+            InsertState::Split(pivot, new_node_ref) => (pivot, new_node_ref),
+        };
 
         let (leaf_key, leaf_value) = (key, value);
+        let mut new_node_ref = new_node_ref.node();
 
         // the node had to split, try insert into the parent.
         let mut insert_stack = vec![];
@@ -381,15 +387,15 @@ where
                 self.metadata.depth += 1;
                 self.update_metadata()?;
 
-                break InternalPtr(NodePtr(root_page_ref));
+                break NodePtr(root_page_ref).assert_is_internal();
             };
 
             // insert into the parent, this might split again
             match self.insert_internal_node(parent, &pivot, new_node_ref)? {
                 InsertInternalState::Inserted => break parent,
-                InsertInternalState::Split(p, InternalPtr(n)) => {
+                InsertInternalState::Split(p, n) => {
                     insert_stack.push((pivot, new_node_ref));
-                    (pivot, new_node_ref) = (p, n)
+                    (pivot, new_node_ref) = (p, n.node())
                 }
             };
         };
@@ -397,13 +403,17 @@ where
         // walk back down the new set of internal nodes
         drop(search_stack);
         while let Some((key, value)) = insert_stack.pop() {
-            current = InternalPtr(self.search_internal_node(current, &key)?);
+            current = self
+                .search_internal_node(current, &key)?
+                .assert_is_internal();
 
             // insert into the node that now is guaranteed to have space
             self.must_insert_internal_node(current, &key, value)?;
         }
 
-        let current = LeafPtr(self.search_internal_node(current, leaf_key)?);
+        let current = self
+            .search_internal_node(current, leaf_key)?
+            .assert_is_leaf();
 
         // insert into the leaf that now is guaranteed to have space
         self.must_insert_leaf_node(current, leaf_key, leaf_value)?;
@@ -551,13 +561,38 @@ pub struct HeapPtr {
 #[repr(transparent)]
 pub struct NodePtr(HeapPtr);
 
-#[derive(KnownLayout, IntoBytes, Unaligned, Immutable, FromBytes, Clone, Copy, PartialEq)]
-#[repr(transparent)]
-pub struct LeafPtr(NodePtr);
+impl NodePtr {
+    pub fn assert_is_internal(self) -> InternalPtr {
+        InternalPtr { private: self }
+    }
+    pub fn assert_is_leaf(self) -> LeafPtr {
+        LeafPtr { private: self }
+    }
+}
 
 #[derive(KnownLayout, IntoBytes, Unaligned, Immutable, FromBytes, Clone, Copy, PartialEq)]
 #[repr(transparent)]
-pub struct InternalPtr(NodePtr);
+pub struct LeafPtr {
+    private: NodePtr,
+}
+
+impl LeafPtr {
+    pub fn node(self) -> NodePtr {
+        self.private
+    }
+}
+
+#[derive(KnownLayout, IntoBytes, Unaligned, Immutable, FromBytes, Clone, Copy, PartialEq)]
+#[repr(transparent)]
+pub struct InternalPtr {
+    private: NodePtr,
+}
+
+impl InternalPtr {
+    pub fn node(self) -> NodePtr {
+        self.private
+    }
+}
 
 #[cfg(test)]
 mod tests {

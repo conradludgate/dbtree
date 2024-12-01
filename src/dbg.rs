@@ -210,12 +210,12 @@ impl fmt::Debug for NodePtr {
 
 impl fmt::Debug for LeafPtr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(f)
+        self.private.fmt(f)
     }
 }
 
 impl fmt::Debug for InternalPtr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(f)
+        self.private.fmt(f)
     }
 }
