@@ -337,9 +337,9 @@ where
         }
 
         // walk through the internal nodes until we find the correct leaf
-        let mut stack = vec![];
+        let mut search_stack = vec![];
         while depth > 0 {
-            stack.push(InternalPtr(current));
+            search_stack.push(InternalPtr(current));
             current = self.search_internal_node(InternalPtr(current), key)?;
             depth -= 1;
         }
@@ -352,12 +352,14 @@ where
                 InsertState::Split(pivot, new_node_ref) => (pivot, new_node_ref),
             };
 
+        let (leaf_key, leaf_value) = (key, value);
+
         // the node had to split, try insert into the parent.
-        let mut stack2 = vec![(*key, value)];
+        let mut insert_stack = vec![];
         let mut current = loop {
             depth += 1;
 
-            let Some(parent) = stack.pop() else {
+            let Some(parent) = search_stack.pop() else {
                 // no more parents, we need to allocate a new root.
                 let root_page_ref = self.allocate()?;
                 {
@@ -386,33 +388,28 @@ where
             match self.insert_internal_node(parent, &pivot, new_node_ref)? {
                 InsertInternalState::Inserted => break parent,
                 InsertInternalState::Split(p, InternalPtr(n)) => {
-                    stack2.push((pivot, new_node_ref.0));
+                    insert_stack.push((pivot, new_node_ref));
                     (pivot, new_node_ref) = (p, n)
                 }
             };
         };
 
         // walk back down the new set of internal nodes
-        drop(stack);
-        loop {
-            let Some((key, value)) = stack2.pop() else {
-                break Ok(None);
-            };
+        drop(search_stack);
+        while let Some((key, value)) = insert_stack.pop() {
+            current = InternalPtr(self.search_internal_node(current, &key)?);
 
-            let c = self.search_internal_node(current, &key)?;
-            depth -= 1;
-
-            if depth > 0 {
-                current = InternalPtr(c);
-                // insert into the leaf that now is guaranteed to have space
-                self.must_insert_internal_node(current, &key, NodePtr(value))?;
-            } else {
-                // insert into the leaf that now is guaranteed to have space
-                self.must_insert_leaf_node(LeafPtr(c), &key, value)?;
-                assert!(stack2.is_empty());
-                break Ok(None);
-            }
+            // insert into the node that now is guaranteed to have space
+            self.must_insert_internal_node(current, &key, value)?;
         }
+
+        let current = LeafPtr(self.search_internal_node(current, leaf_key)?);
+
+        // insert into the leaf that now is guaranteed to have space
+        self.must_insert_leaf_node(current, leaf_key, leaf_value)?;
+        assert!(insert_stack.is_empty());
+
+        Ok(None)
     }
 }
 
