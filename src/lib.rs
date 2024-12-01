@@ -353,8 +353,8 @@ where
             };
 
         // the node had to split, try insert into the parent.
-        let mut stack2 = vec![(*key, value, depth)];
-        let InternalPtr(mut current) = loop {
+        let mut stack2 = vec![(*key, value)];
+        let mut current = loop {
             depth += 1;
 
             let Some(parent) = stack.pop() else {
@@ -386,7 +386,7 @@ where
             match self.insert_internal_node(parent, &pivot, new_node_ref)? {
                 InsertInternalState::Inserted => break parent,
                 InsertInternalState::Split(p, InternalPtr(n)) => {
-                    stack2.push((pivot, new_node_ref.0, depth));
+                    stack2.push((pivot, new_node_ref.0));
                     (pivot, new_node_ref) = (p, n)
                 }
             };
@@ -395,21 +395,22 @@ where
         // walk back down the new set of internal nodes
         drop(stack);
         loop {
-            let Some((key, value, d)) = stack2.pop() else {
+            let Some((key, value)) = stack2.pop() else {
                 break Ok(None);
             };
 
-            while depth > d {
-                current = self.search_internal_node(InternalPtr(current), &key)?;
-                depth -= 1;
-            }
+            let c = self.search_internal_node(current, &key)?;
+            depth -= 1;
 
-            if d > 0 {
+            if depth > 0 {
+                current = InternalPtr(c);
                 // insert into the leaf that now is guaranteed to have space
-                self.must_insert_internal_node(InternalPtr(current), &key, NodePtr(value))?;
+                self.must_insert_internal_node(current, &key, NodePtr(value))?;
             } else {
                 // insert into the leaf that now is guaranteed to have space
-                self.must_insert_leaf_node(LeafPtr(current), &key, value)?;
+                self.must_insert_leaf_node(LeafPtr(c), &key, value)?;
+                assert!(stack2.is_empty());
+                break Ok(None);
             }
         }
     }
