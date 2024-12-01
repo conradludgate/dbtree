@@ -115,21 +115,35 @@ impl<S: PageSource<F::Page>, F: Factor> BTree<S, F> {
         }
     }
 
-    pub fn search(&self, key: &F::Key) -> io::Result<Option<HeapPtr>> {
-        let mut depth = self.metadata.depth.get();
-        let mut current = self.metadata.root;
+    fn search_tree(
+        &self,
+        mut node: NodePtr,
+        mut depth: u64,
+        key: &F::Key,
+        mut f: impl FnMut(InternalPtr),
+    ) -> io::Result<LeafPtr> {
+        loop {
+            if depth == 0 {
+                break Ok(node.assert_is_leaf());
+            }
 
+            let c = node.assert_is_internal();
+            f(c);
+            node = self.search_internal_node(c, key)?;
+            depth -= 1;
+        }
+    }
+
+    pub fn search(&self, key: &F::Key) -> io::Result<Option<HeapPtr>> {
         // the btree is currently empty.
-        if current.0 == NODE_SENTINAL {
+        if self.metadata.root.0 == NODE_SENTINAL {
             return Ok(None);
         }
 
         // walk through the internal nodes until we find the correct leaf
-        while depth > 0 {
-            current = self.search_internal_node(current.assert_is_internal(), key)?;
-            depth -= 1;
-        }
-        match self.search_leaf_node(current.assert_is_leaf(), key)? {
+        let leaf = self.search_tree(self.metadata.root, self.metadata.depth.get(), key, |_| {})?;
+
+        match self.search_leaf_node(leaf, key)? {
             SearchEntry::Occupied(_, node_ref) => Ok(Some(node_ref)),
             SearchEntry::Vacant(_) => Ok(None),
         }
@@ -317,109 +331,107 @@ where
 
     // returns the old NodeRef if there was one.
     pub fn insert(&mut self, key: &F::Key, value: HeapPtr) -> io::Result<Option<HeapPtr>> {
-        let mut depth = self.metadata.depth.get();
-        let mut current = self.metadata.root;
+        let mut search_stack = Vec::with_capacity(self.metadata.depth.get() as usize);
 
-        // the btree is currently empty.
-        // allocate a new empty root.
-        if current.0 == NODE_SENTINAL {
-            let root_page_ref = self.allocate()?;
-
-            let mut page = F::Page::new_zeroed();
-            {
-                let (_root_node, _) = LeafNode::<F>::mut_from_prefix(page.as_mut_bytes()).unwrap();
-                // zero value for the leaf is valid as empty
-            }
-
-            self.page_store.write_page(root_page_ref, &mut page)?;
-
-            self.metadata.root = NodePtr(root_page_ref);
-            self.update_metadata()?;
-
-            current = NodePtr(root_page_ref);
-        }
-
-        // walk through the internal nodes until we find the correct leaf
-        let mut search_stack = vec![];
-        while depth > 0 {
-            let c = current.assert_is_internal();
-            search_stack.push(c);
-            current = self.search_internal_node(c, key)?;
-            depth -= 1;
-        }
-
-        let leaf = current.assert_is_leaf();
-
-        // try insert into the leaf
-        let (mut pivot, new_node_ref) = match self.insert_leaf_node(leaf, key, value)? {
-            InsertState::Inserted => return Ok(None),
-            InsertState::Replaced(node_ref) => return Ok(Some(node_ref)),
-            InsertState::Split(pivot, new_node_ref) => (pivot, new_node_ref),
+        let leaf = if self.metadata.root.0 == NODE_SENTINAL {
+            // the btree is currently empty.
+            // allocate a new empty root leaf.
+            self.alloc_empty_root()?
+        } else {
+            // walk through the internal nodes until we find the correct leaf
+            self.search_tree(self.metadata.root, self.metadata.depth.get(), key, |c| {
+                search_stack.push(c)
+            })?
         };
 
+        // try insert into the leaf
+        let (mut pivot, mut split_node_ptr) = match self.insert_leaf_node(leaf, key, value)? {
+            InsertState::Inserted => return Ok(None),
+            InsertState::Replaced(heap_ptr) => return Ok(Some(heap_ptr)),
+            InsertState::Split(pivot, new_node_ptr) => (pivot, new_node_ptr.node()),
+        };
+
+        // saved for later
         let (leaf_key, leaf_value) = (key, value);
-        let mut new_node_ref = new_node_ref.node();
-
-        // the node had to split, try insert into the parent.
         let mut insert_stack = vec![];
-        let mut current = loop {
-            depth += 1;
 
-            let Some(parent) = search_stack.pop() else {
-                // no more parents, we need to allocate a new root.
-                let root_page_ref = self.allocate()?;
-                {
-                    let mut page = F::Page::new_zeroed();
-                    {
-                        let (root_node, _) =
-                            InternalNode::<F>::mut_from_prefix(page.as_mut_bytes()).unwrap();
+        let mut node = {
+            // the node had to split, try insert into the parent.
+            let mut stack = search_stack.into_iter().rev();
+            loop {
+                let Some(parent) = stack.next() else {
+                    break self.split_root(pivot, split_node_ptr)?;
+                };
 
-                        root_node.len.set(1);
-                        root_node.min = self.metadata.root;
-                        root_node.keys[0] = pivot;
-                        root_node.values[0] = new_node_ref;
+                // insert into the parent, this might split again
+                match self.insert_internal_node(parent, &pivot, split_node_ptr)? {
+                    InsertInternalState::Inserted => break parent,
+                    InsertInternalState::Split(p, n) => {
+                        insert_stack.push((pivot, split_node_ptr));
+                        (pivot, split_node_ptr) = (p, n.node())
                     }
-
-                    self.page_store.write_page(root_page_ref, &mut page)?;
-                }
-
-                self.metadata.root = NodePtr(root_page_ref);
-                self.metadata.depth += 1;
-                self.update_metadata()?;
-
-                break NodePtr(root_page_ref).assert_is_internal();
-            };
-
-            // insert into the parent, this might split again
-            match self.insert_internal_node(parent, &pivot, new_node_ref)? {
-                InsertInternalState::Inserted => break parent,
-                InsertInternalState::Split(p, n) => {
-                    insert_stack.push((pivot, new_node_ref));
-                    (pivot, new_node_ref) = (p, n.node())
-                }
-            };
+                };
+            }
         };
 
         // walk back down the new set of internal nodes
-        drop(search_stack);
-        while let Some((key, value)) = insert_stack.pop() {
-            current = self
-                .search_internal_node(current, &key)?
-                .assert_is_internal();
+        let leaf = loop {
+            let Some((key, value)) = insert_stack.pop() else {
+                break self.search_internal_node(node, leaf_key)?.assert_is_leaf();
+            };
 
             // insert into the node that now is guaranteed to have space
-            self.must_insert_internal_node(current, &key, value)?;
-        }
-
-        let current = self
-            .search_internal_node(current, leaf_key)?
-            .assert_is_leaf();
+            node = self.search_internal_node(node, &key)?.assert_is_internal();
+            self.must_insert_internal_node(node, &key, value)?;
+        };
 
         // insert into the leaf that now is guaranteed to have space
-        self.must_insert_leaf_node(current, leaf_key, leaf_value)?;
+        self.must_insert_leaf_node(leaf, leaf_key, leaf_value)?;
         assert!(insert_stack.is_empty());
 
         Ok(None)
+    }
+
+    fn alloc_empty_root(&mut self) -> io::Result<LeafPtr> {
+        let root_page_ref = self.allocate()?;
+
+        let mut page = F::Page::new_zeroed();
+        {
+            let (_root_node, _) = LeafNode::<F>::mut_from_prefix(page.as_mut_bytes()).unwrap();
+            // zero value for the leaf is valid as empty
+        }
+
+        self.page_store.write_page(root_page_ref, &mut page)?;
+
+        self.metadata.root = NodePtr(root_page_ref);
+        self.update_metadata()?;
+
+        Ok(NodePtr(root_page_ref).assert_is_leaf())
+    }
+
+    fn split_root(&mut self, pivot: F::Key, node_ptr: NodePtr) -> io::Result<InternalPtr> {
+        // no more parents, we need to allocate a new root.
+        let root_page_ref = self.allocate()?;
+        {
+            let mut page = F::Page::new_zeroed();
+            {
+                let (root_node, _) =
+                    InternalNode::<F>::mut_from_prefix(page.as_mut_bytes()).unwrap();
+
+                root_node.len.set(1);
+                root_node.min = self.metadata.root;
+                root_node.keys[0] = pivot;
+                root_node.values[0] = node_ptr;
+            }
+
+            self.page_store.write_page(root_page_ref, &mut page)?;
+        }
+
+        self.metadata.root = NodePtr(root_page_ref);
+        self.metadata.depth += 1;
+        self.update_metadata()?;
+
+        Ok(NodePtr(root_page_ref).assert_is_internal())
     }
 }
 
